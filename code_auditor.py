@@ -1,32 +1,13 @@
 #!/usr/bin/env python3
 """
-code_auditor.py – Production-grade LLM Code Review Complexity Auditor (Optimized)
+code_auditor.py – Production-grade LLM Code Review Complexity Auditor (v4.3.1)
 
-Purpose
--------
-Triage Python functions that deserve human review. The tool combines:
-  • Source character entropy
-  • Opcode pattern entropy across multiple scales
-  • Experimental fractal dimension
-  • AST structural complexity
-  • Maintainability indicators
-  • Risk/code-smell pattern detection
+Optimized single-pass AST visitor, O(1) bytecode lookup, fast & accurate source extraction.
+Balanced scoring tuned for LLM-generated code triage (40% anomaly / 40% maintainability / 20% risk).
+Compact readable table by default, --verbose for full details.
 
-Optimizations Applied
----------------------
-  • Single-pass AST traversal (merged complexity + risk visitors)
-  • Compile-once-per-file with O(1) code-object lookup map
-  • Fast line-slice source extraction (replaces slow ast.unparse fallback)
-  • Filter-then-sort pipeline to reduce sort overhead
-  • Deterministic bytecode normalization without tuple allocation churn
-  • Memory-efficient file discovery with early exclusion pruning
-
-Compatibility
--------------
-Fully backward-compatible with v4.2 CLI flags, output formats, and scoring logic.
+Fully backward-compatible with all previous CLI flags.
 """
-
-from __future__ import annotations
 
 import argparse
 import ast
@@ -55,19 +36,22 @@ BOLD = "\033[1m"
 # ------------------------------------------------------------------------------
 # Version & constants
 # ------------------------------------------------------------------------------
-__version__ = "4.3.0"
-
+__version__ = "4.3.1"
 DEFAULT_SCALES = [1, 2, 4, 8, 16]
 DEFAULT_M = 2
 MIN_BYTECODE_LENGTH = 8
 MAX_OPCODE_PATTERN_ENTROPY = 5.0
+
+# Balanced LLM-triage weights
+MAINTAINABILITY_WEIGHT = 0.40
+ANOMALY_WEIGHT = 0.40
+RISK_WEIGHT = 0.20
 
 DEFAULT_EXCLUDE_DIRS = {
     ".git", ".hg", ".svn", ".venv", "venv", "env", "__pycache__",
     ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".nox",
     "node_modules", "site-packages", "dist", "build", "htmlcov",
 }
-
 DEFAULT_TEST_DIR_NAMES = {"test", "tests", "testing", "spec", "specs"}
 
 SortKey = Literal[
@@ -113,10 +97,6 @@ class RiskMetrics:
     import_star: int = 0
 
     @property
-    def dangerous_calls(self) -> int:
-        return self.eval_exec_calls + self.shell_true
-
-    @property
     def total_risk_events(self) -> int:
         return sum(asdict(self).values())
 
@@ -157,9 +137,7 @@ def normalize(value: float, low: float, high: float) -> float:
 
 def safe_mean(values: Iterable[float]) -> float:
     vals = list(values)
-    if not vals:
-        return 0.0
-    return float(sum(vals) / len(vals))
+    return float(sum(vals) / len(vals)) if vals else 0.0
 
 
 def shannon_entropy(text: str) -> float:
@@ -183,53 +161,38 @@ def is_probably_test_file(path: Path) -> bool:
 
 
 def should_use_color(no_color: bool, output_path: Optional[Path]) -> bool:
-    if no_color:
-        return False
-    if output_path is not None:
+    if no_color or output_path is not None:
         return False
     return sys.stdout.isatty()
 
 
 def colorize(text: str, color: str, enabled: bool) -> str:
-    if not enabled:
-        return text
-    return f"{color}{text}{RESET}"
+    return f"{color}{text}{RESET}" if enabled else text
 
 
 def color_score(score: int, enabled: bool) -> str:
-    raw = str(score)
     if score >= 75:
-        return colorize(raw, RED, enabled)
+        return colorize(str(score), RED, enabled)
     if score >= 50:
-        return colorize(raw, YELLOW, enabled)
-    return colorize(raw, GREEN, enabled)
-
-
-def score_cell(score: int, width: int, enabled: bool) -> str:
-    raw = str(score)
-    padding = " " * max(0, width - len(raw))
-    return color_score(score, enabled) + padding
+        return colorize(str(score), YELLOW, enabled)
+    return colorize(str(score), GREEN, enabled)
 
 
 # ------------------------------------------------------------------------------
-# Opcode pattern entropy
+# Opcode pattern entropy & MSE
 # ------------------------------------------------------------------------------
 def _opcode_pattern_entropy(seq: List[int], m: int = DEFAULT_M) -> float:
     n = len(seq)
     if n < m + 1:
         return 0.0
-
     count_m: Counter[Tuple[int, ...]] = Counter()
     for i in range(n - m + 1):
-        count_m[tuple(seq[i : i + m])] += 1
-
+        count_m[tuple(seq[i:i + m])] += 1
     count_m1: Counter[Tuple[int, ...]] = Counter()
     for i in range(n - m):
-        count_m1[tuple(seq[i : i + m + 1])] += 1
-
+        count_m1[tuple(seq[i:i + m + 1])] += 1
     b = sum(c * (c - 1) for c in count_m.values())
     a = sum(c * (c - 1) for c in count_m1.values())
-
     if b == 0:
         return 0.0
     if a == 0:
@@ -252,11 +215,7 @@ def _coarse_grain_mode(seq: List[int], tau: int) -> List[int]:
     return out
 
 
-def multi_scale_entropy(
-    seq: List[int],
-    scales: Optional[List[int]] = None,
-    m: int = DEFAULT_M,
-) -> List[Tuple[int, float]]:
+def multi_scale_entropy(seq: List[int], scales: Optional[List[int]] = None, m: int = DEFAULT_M) -> List[Tuple[int, float]]:
     if scales is None:
         scales = DEFAULT_SCALES
     profile: List[Tuple[int, float]] = []
@@ -264,8 +223,7 @@ def multi_scale_entropy(
         if tau <= 0 or tau > len(seq):
             continue
         coarse = _coarse_grain_mode(seq, tau) if tau > 1 else seq
-        entropy = _opcode_pattern_entropy(coarse, m)
-        profile.append((tau, entropy))
+        profile.append((tau, _opcode_pattern_entropy(coarse, m)))
     return profile
 
 
@@ -280,21 +238,13 @@ def mse_area(profile: List[Tuple[int, float]]) -> float:
     return area
 
 
-def mse_area_normalized(
-    profile: List[Tuple[int, float]],
-    max_entropy: float = MAX_OPCODE_PATTERN_ENTROPY,
-) -> float:
+def mse_area_normalized(profile: List[Tuple[int, float]]) -> float:
     if len(profile) < 2:
         return 0.0
     area = mse_area(profile)
-    max_area = 0.0
-    for i in range(len(profile) - 1):
-        x1, _ = profile[i]
-        x2, _ = profile[i + 1]
-        max_area += 0.5 * (x2 - x1) * (max_entropy + max_entropy)
-    if max_area <= 0:
-        return 0.0
-    return max(0.0, min(1.0, area / max_area))
+    max_area = sum(0.5 * (x2 - x1) * (MAX_OPCODE_PATTERN_ENTROPY * 2)
+                   for (x1, _), (x2, _) in zip(profile, profile[1:]))
+    return min(1.0, area / max_area) if max_area > 0 else 0.0
 
 
 # ------------------------------------------------------------------------------
@@ -315,23 +265,18 @@ def fractal_dimension(seq: List[int]) -> float:
 
     log_scales: List[float] = []
     log_counts: List[float] = []
-    min_op = min(seq)
-    max_op = max(seq)
+    min_op, max_op = min(seq), max(seq)
     span = max(1, max_op - min_op)
-
     for size in sizes:
         boxes: set[Tuple[int, int]] = set()
         y_bins = max(1, math.ceil(n / size))
         for i, opcode in enumerate(seq):
             bx = i // size
-            normalized_y = (opcode - min_op) / span
-            by = min(y_bins - 1, int(normalized_y * y_bins))
+            by = min(y_bins - 1, int(((opcode - min_op) / span) * y_bins))
             boxes.add((bx, by))
-        count = len(boxes)
-        if count > 0:
+        if boxes:
             log_scales.append(math.log(size))
-            log_counts.append(math.log(count))
-
+            log_counts.append(math.log(len(boxes)))
     if len(log_scales) < 3:
         return 0.0
     points = len(log_scales)
@@ -347,7 +292,7 @@ def fractal_dimension(seq: List[int]) -> float:
 
 
 # ------------------------------------------------------------------------------
-# AST collection & metrics
+# Optimized AST collection & metrics (single-pass)
 # ------------------------------------------------------------------------------
 class FunctionCollector(ast.NodeVisitor):
     def __init__(self) -> None:
@@ -384,7 +329,6 @@ def collect_functions(tree: ast.AST) -> List[Dict[str, Any]]:
     return collector.functions
 
 
-# OPTIMIZATION: Single-pass AST visitor for complexity + risk metrics
 class FunctionMetricsVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.branches = self.loops = self.try_blocks = self.bool_ops = 0
@@ -507,16 +451,11 @@ class FunctionMetricsVisitor(ast.NodeVisitor):
                     self.mutable_defaults += 1
 
     def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
-        if node.type is None:
+        if node.type is None or \
+           (isinstance(node.type, ast.Name) and node.type.id in {"Exception", "BaseException"}) or \
+           (isinstance(node.type, ast.Tuple) and any(isinstance(elt, ast.Name) and elt.id in {"Exception", "BaseException"} for elt in node.type.elts)):
             self.broad_excepts += 1
-        elif isinstance(node.type, ast.Name) and node.type.id in {"Exception", "BaseException"}:
-            self.broad_excepts += 1
-        elif isinstance(node.type, ast.Tuple):
-            for elt in node.type.elts:
-                if isinstance(elt, ast.Name) and elt.id in {"Exception", "BaseException"}:
-                    self.broad_excepts += 1
-                    break
-        meaningful_body = [stmt for stmt in node.body if not isinstance(stmt, ast.Expr) or not isinstance(getattr(stmt, "value", None), ast.Constant)]
+        meaningful_body = [stmt for stmt in node.body if not isinstance(stmt, ast.Expr) or not isinstance(getattr(getattr(stmt, "value", None), "value", None), ast.Constant)]
         if not meaningful_body or all(isinstance(stmt, ast.Pass) for stmt in meaningful_body):
             self.silent_excepts += 1
         self._except_depth += 1
@@ -550,9 +489,8 @@ def _effective_loc_from_segment(segment: str) -> int:
     count = 0
     for line in segment.splitlines():
         stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        count += 1
+        if stripped and not stripped.startswith("#"):
+            count += 1
     return count
 
 
@@ -566,11 +504,7 @@ def _arg_count(node: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
     return total
 
 
-def build_ast_metrics(
-    node: ast.FunctionDef | ast.AsyncFunctionDef,
-    visitor: FunctionMetricsVisitor,
-    source_segment: str,
-) -> ASTMetrics:
+def build_ast_metrics(node: ast.FunctionDef | ast.AsyncFunctionDef, visitor: FunctionMetricsVisitor, source_segment: str) -> ASTMetrics:
     loc = max(1, getattr(node, "end_lineno", node.lineno) - node.lineno + 1)
     effective_loc = _effective_loc_from_segment(source_segment) if source_segment else loc
     cyclomatic = 1 + visitor.branches + visitor.loops + visitor.try_blocks + visitor.bool_ops + visitor.comprehensions
@@ -611,10 +545,9 @@ def build_risk_metrics(visitor: FunctionMetricsVisitor) -> RiskMetrics:
 
 
 # ------------------------------------------------------------------------------
-# Bytecode utilities
+# Fast bytecode lookup
 # ------------------------------------------------------------------------------
 def _build_code_map(module_code: types.CodeType) -> dict[tuple[int, str], types.CodeType]:
-    """O(K) iterative collection of all code objects in a module. K = total code objects."""
     code_map: dict[tuple[int, str], types.CodeType] = {}
     stack = [module_code]
     while stack:
@@ -628,7 +561,7 @@ def _build_code_map(module_code: types.CodeType) -> dict[tuple[int, str], types.
 
 
 # ------------------------------------------------------------------------------
-# Scoring and explanations
+# Scoring
 # ------------------------------------------------------------------------------
 def maintainability_subscore(ast_m: ASTMetrics) -> int:
     components = [
@@ -664,9 +597,7 @@ def anomaly_subscore(
     if fractal_val is not None:
         weighted += normalize(fractal_val, 0.25, 1.25) * 0.10
         weights += 0.10
-    if weights == 0:
-        return 0
-    return int(round((weighted / weights) * 100))
+    return int(round((weighted / weights) * 100)) if weights > 0 else 0
 
 
 def risk_subscore(risk_m: RiskMetrics) -> int:
@@ -684,16 +615,11 @@ def risk_subscore(risk_m: RiskMetrics) -> int:
     return int(round(weighted * 100))
 
 
-def composite_complexity_score(
-    maintainability: int,
-    anomaly: int,
-    risk: int,
-    have_anomaly_metrics: bool,
-) -> int:
+def composite_complexity_score(maintainability: int, anomaly: int, risk: int, have_anomaly_metrics: bool) -> int:
     if have_anomaly_metrics:
-        score = maintainability * 0.65 + anomaly * 0.15 + risk * 0.20
+        score = maintainability * MAINTAINABILITY_WEIGHT + anomaly * ANOMALY_WEIGHT + risk * RISK_WEIGHT
     else:
-        score = maintainability * 0.75 + risk * 0.25
+        score = maintainability * 0.60 + risk * 0.40
     return int(round(max(0.0, min(100.0, score))))
 
 
@@ -706,58 +632,48 @@ def explain_result(result: AuditResult) -> List[str]:
     elif ast_m.loc >= 50:
         reasons.append(f"medium-large function: {ast_m.loc} lines")
     if ast_m.cyclomatic >= 15:
-        reasons.append(f"very high cyclomatic complexity: {ast_m.cyclomatic}")
+        reasons.append(f"very high cyclomatic: {ast_m.cyclomatic}")
     elif ast_m.cyclomatic >= 10:
-        reasons.append(f"high cyclomatic complexity: {ast_m.cyclomatic}")
+        reasons.append(f"high cyclomatic: {ast_m.cyclomatic}")
     if ast_m.max_control_depth >= 6:
-        reasons.append(f"deep control nesting: {ast_m.max_control_depth}")
+        reasons.append(f"deep nesting: {ast_m.max_control_depth}")
     elif ast_m.max_control_depth >= 4:
-        reasons.append(f"moderate control nesting: {ast_m.max_control_depth}")
+        reasons.append(f"moderate nesting: {ast_m.max_control_depth}")
     if ast_m.arg_count >= 8:
         reasons.append(f"many parameters: {ast_m.arg_count}")
     if ast_m.calls >= 40:
-        reasons.append(f"many function calls: {ast_m.calls}")
+        reasons.append(f"many calls: {ast_m.calls}")
     if ast_m.returns >= 8:
         reasons.append(f"many return paths: {ast_m.returns}")
     if result.opcode_entropy_mean is not None and result.opcode_entropy_mean >= 3.0:
         reasons.append(f"high opcode pattern entropy: {result.opcode_entropy_mean:.2f}")
     if result.src_entropy is not None and result.src_entropy >= 4.8:
-        reasons.append(f"high source character entropy: {result.src_entropy:.2f}")
+        reasons.append(f"high source entropy: {result.src_entropy:.2f}")
     if result.mse_area_normalized is not None and result.mse_area_normalized >= 0.65:
-        reasons.append(f"high normalized multi-scale opcode entropy area: {result.mse_area_normalized:.2f}")
+        reasons.append(f"high normalized MSE: {result.mse_area_normalized:.2f}")
     if result.fractal is not None and result.fractal >= 1.0:
-        reasons.append(f"high experimental opcode-shape fractal signal: {result.fractal:.2f}")
+        reasons.append(f"high fractal signal: {result.fractal:.2f}")
     if risk_m.broad_excepts:
-        reasons.append(f"broad exception handlers: {risk_m.broad_excepts}")
+        reasons.append(f"broad excepts: {risk_m.broad_excepts}")
     if risk_m.silent_excepts:
-        reasons.append(f"silent exception handlers: {risk_m.silent_excepts}")
+        reasons.append(f"silent excepts: {risk_m.silent_excepts}")
     if risk_m.eval_exec_calls:
-        reasons.append(f"eval/exec calls: {risk_m.eval_exec_calls}")
+        reasons.append(f"eval/exec: {risk_m.eval_exec_calls}")
     if risk_m.shell_true:
-        reasons.append(f"subprocess shell=True usage: {risk_m.shell_true}")
+        reasons.append(f"shell=True: {risk_m.shell_true}")
     if risk_m.dynamic_attr >= 3:
-        reasons.append(f"heavy dynamic attribute usage: {risk_m.dynamic_attr}")
+        reasons.append(f"dynamic attrs: {risk_m.dynamic_attr}")
     if risk_m.mutable_defaults:
-        reasons.append(f"mutable default arguments: {risk_m.mutable_defaults}")
+        reasons.append(f"mutable defaults: {risk_m.mutable_defaults}")
     if risk_m.assert_statements >= 3:
-        reasons.append(f"multiple assert statements in runtime code: {risk_m.assert_statements}")
+        reasons.append(f"many asserts: {risk_m.assert_statements}")
     if not reasons:
-        reasons.append("no dominant issue; score comes from combined moderate signals")
+        reasons.append("combined moderate signals")
     return reasons
 
 
-def complexity_score(
-    src_entropy: Optional[float],
-    mse_area_val: Optional[float],
-    fractal_val: Optional[float],
-) -> int:
-    mse_norm = normalize(mse_area_val, 0.0, 25.0) if mse_area_val is not None else None
-    anomaly = anomaly_subscore(src_entropy, None, mse_norm, fractal_val)
-    return anomaly
-
-
 # ------------------------------------------------------------------------------
-# Core auditor
+# Core auditor (optimized + accurate source extraction)
 # ------------------------------------------------------------------------------
 class CodeAuditor:
     def __init__(
@@ -775,45 +691,50 @@ class CodeAuditor:
         self.compute_fractal = compute_fractal
 
     def analyse_file(self, path: Path) -> List[AuditResult]:
-        source = path.read_text(encoding="utf-8", errors="replace")
-        tree = ast.parse(source)
+        try:
+            source = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise RuntimeError(f"Cannot read {path}: {exc}") from exc
+
+        try:
+            tree = ast.parse(source)
+        except SyntaxError as exc:
+            raise RuntimeError(f"Syntax error in {path}: {exc}") from exc
+
         funcs_info = collect_functions(tree)
         if not funcs_info:
             return []
 
-        # OPTIMIZATION: Compile once per file, build O(1) code-object map
+        # OPTIMIZATIONS
         module_code = compile(source, str(path), "exec")
         code_map = _build_code_map(module_code)
-
-        # OPTIMIZATION: Pre-split for O(1) line slicing
         source_lines = source.splitlines()
-        results: List[AuditResult] = []
 
+        results: List[AuditResult] = []
         for info in funcs_info:
             node = info["node"]
             name = info["qualname"]
             lineno = info["lineno"]
             end_lineno = info["end_lineno"]
 
-            # Fast deterministic source extraction
-            segment = "\n".join(source_lines[lineno-1:end_lineno])
+            # Fast + accurate source extraction
+            try:
+                segment = ast.get_source_segment(source, node) or "\n".join(source_lines[lineno - 1:end_lineno])
+            except Exception:
+                segment = "\n".join(source_lines[lineno - 1:end_lineno])
             snippet = segment.strip()
 
             src_entropy = shannon_entropy(segment) if self.compute_source else None
 
-            # Single-pass AST traversal
+            # Single-pass metrics
             visitor = FunctionMetricsVisitor()
             visitor.visit(node)
             ast_m = build_ast_metrics(node, visitor, segment)
             risk_m = build_risk_metrics(visitor)
 
-            opcode_entropy_mean: Optional[float] = None
-            mse_area_val: Optional[float] = None
-            mse_area_norm: Optional[float] = None
-            mse_profile: Optional[List[Tuple[int, float]]] = None
-            fractal_val: Optional[float] = None
-
             # O(1) bytecode lookup
+            opcode_entropy_mean = mse_area_val = mse_area_norm = fractal_val = None
+            mse_profile: Optional[List[Tuple[int, float]]] = None
             code_obj = code_map.get((lineno, name))
             if code_obj:
                 bytecode = opcodes_from_code(code_obj)
@@ -859,58 +780,51 @@ class CodeAuditor:
 
 
 # ------------------------------------------------------------------------------
-# CLI & output
+# CLI & output (compact table by default)
 # ------------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="LLM Code Auditor – complexity, anomaly, and risk triage for Python functions",
+        description="LLM Code Auditor v4.3.1 – optimized + LLM-tuned scoring",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("paths", nargs="+", type=Path, help="Python file(s) or directory(s)")
     parser.add_argument("--source-entropy", action="store_true", dest="source", help="Compute source Shannon entropy")
     parser.add_argument("--mse", action="store_true", help="Compute multi-scale opcode pattern entropy")
-    parser.add_argument("--fractal", action="store_true", help="Compute experimental opcode-shape fractal dimension")
+    parser.add_argument("--fractal", action="store_true", help="Compute experimental fractal dimension")
     parser.add_argument("--scales", type=int, nargs="+", default=DEFAULT_SCALES, help=f"MSE scales (default: {DEFAULT_SCALES})")
     parser.add_argument("--m", type=int, default=DEFAULT_M, help="Opcode n-gram embedding length (default: 2)")
     parser.add_argument("--format", choices=["table", "json"], default="table", help="Output format")
-    parser.add_argument("--verbose", action="store_true", help="Show full MSE profiles and extra metric details")
-    parser.add_argument("--top-source", type=int, default=0, metavar="N", help="Show source of the N highest-scoring functions (0=off)")
+    parser.add_argument("--verbose", action="store_true", help="Full columns + extra diagnostics")
+    parser.add_argument("--top-source", type=int, default=0, metavar="N", help="Show source of top N functions (0=off)")
     parser.add_argument("--output", type=Path, help="Write results to file")
-    parser.add_argument("--explain", action="store_true", help="Show reasons each high-scoring function was flagged")
-    parser.add_argument("--min-score", type=int, default=0, help="Only display functions with complexity >= this score")
-    parser.add_argument("--sort", choices=list(SortKey.__args__), default="complexity", help="Sort results by metric")
-    parser.add_argument("--fail-above", type=int, help="Exit with code 2 if any function complexity is >= this value")
-    parser.add_argument("--exclude", nargs="*", default=[], help="Additional directory names or path fragments to exclude")
-    parser.add_argument("--include-tests", action="store_true", help="Include test files and test directories")
-    parser.add_argument("--no-color", action="store_true", help="Disable ANSI color output")
+    parser.add_argument("--explain", action="store_true", help="Show why each high-scoring function was flagged")
+    parser.add_argument("--min-score", type=int, default=0, help="Only show functions with complexity >= N")
+    parser.add_argument("--sort", choices=list(SortKey.__args__), default="complexity", help="Sort key")
+    parser.add_argument("--fail-above", type=int, help="Exit code 2 if any score >= N (CI friendly)")
+    parser.add_argument("--exclude", nargs="*", default=[], help="Extra exclude patterns")
+    parser.add_argument("--include-tests", action="store_true", help="Include test files")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
 
 
-def find_python_files(
-    paths: Sequence[Path],
-    exclude: Optional[Iterable[str]] = None,
-    include_tests: bool = False,
-) -> Iterator[Path]:
+def find_python_files(paths: Sequence[Path], exclude: Optional[Iterable[str]] = None, include_tests: bool = False) -> Iterator[Path]:
     exclude_set = set(DEFAULT_EXCLUDE_DIRS)
     if exclude:
         exclude_set.update(item for item in exclude if item)
-
     seen: set[Path] = set()
 
-    def excluded(path: Path) -> bool:
-        parts = set(path.parts)
+    def excluded(p: Path) -> bool:
+        parts = set(p.parts)
         if parts & exclude_set:
             return True
-        as_posix = path.as_posix()
-        return any(fragment in as_posix for fragment in exclude_set if "/" in fragment or fragment.startswith("."))
+        posix = p.as_posix()
+        return any(fragment in posix for fragment in exclude_set if "/" in fragment or fragment.startswith("."))
 
     for p in paths:
         p = p.expanduser()
         if p.is_file() and p.suffix == ".py":
-            if excluded(p):
-                continue
-            if not include_tests and is_probably_test_file(p):
+            if excluded(p) or (not include_tests and is_probably_test_file(p)):
                 continue
             resolved = p.resolve()
             if resolved not in seen:
@@ -918,9 +832,7 @@ def find_python_files(
                 yield p
         elif p.is_dir():
             for child in p.rglob("*.py"):
-                if excluded(child):
-                    continue
-                if not include_tests and is_probably_test_file(child):
+                if excluded(child) or (not include_tests and is_probably_test_file(child)):
                     continue
                 resolved = child.resolve()
                 if resolved not in seen:
@@ -928,42 +840,14 @@ def find_python_files(
                     yield child
 
 
-def _sort_value(result: AuditResult, sort_key: SortKey) -> float:
-    if sort_key == "complexity": return result.complexity
-    if sort_key == "risk": return result.risk_score
-    if sort_key == "maintainability": return result.maintainability_score
-    if sort_key == "anomaly": return result.anomaly_score
-    if sort_key == "loc": return result.ast_metrics.loc
-    if sort_key == "cyclomatic": return result.ast_metrics.cyclomatic
-    if sort_key == "mse": return result.opcode_entropy_mean if result.opcode_entropy_mean is not None else -1
-    if sort_key == "fractal": return result.fractal if result.fractal is not None else -1
-    if sort_key == "source": return result.src_entropy if result.src_entropy is not None else -1
-    return result.complexity
-
-
-def _visible_len(value: str) -> int:
-    return len(value)
-
-
-def _cell(value: str, width: int, *, truncate: bool = True) -> str:
-    visible = _visible_len(value)
-    if truncate and visible > width:
-        if width <= 1:
-            return value[:width]
-        return value[: max(0, width - 1)] + "…"
-    if visible >= width:
-        return value
-    return value + " " * (width - visible)
-
-
-def _display_path(path: str, width: int) -> str:
-    return _cell(path, width, truncate=False)
+def _cell(value: str, width: int) -> str:
+    if len(value) > width:
+        return value[:max(0, width - 1)] + "…"
+    return f"{value:<{width}}"
 
 
 def _fmt_optional(value: Optional[float], width: int, precision: int = 2) -> str:
-    if value is None:
-        return _cell("N/A", width)
-    return _cell(f"{value:.{precision}f}", width)
+    return _cell("N/A", width) if value is None else _cell(f"{value:.{precision}f}", width)
 
 
 def print_table(results: List[AuditResult], verbose: bool, use_color: bool) -> None:
@@ -976,12 +860,16 @@ def print_table(results: List[AuditResult], verbose: bool, use_color: bool) -> N
     has_fractal = any(r.fractal is not None for r in results)
 
     cols: List[Tuple[str, int]] = [
-        ("File", 28), ("Function", 32), ("Line", 6), ("LOC", 5), ("Cyclo", 6),
-        ("Nest", 5), ("Risk", 5), ("Maint", 6), ("Anom", 5),
+        ("File", 28), ("Function", 32), ("Line", 6), ("LOC", 5),
+        ("Cyclo", 6), ("Risk", 5), ("Maint", 6), ("Anom", 5),
     ]
-    if has_source: cols.append(("SrcEnt", 8))
-    if has_mse: cols.append(("OpEnt", 7)); cols.append(("MSEn", 6))
-    if has_fractal: cols.append(("FracD", 7))
+    if verbose:
+        if has_source:
+            cols.append(("SrcEnt", 8))
+        if has_mse:
+            cols.extend([("OpEnt", 7), ("MSEn", 6)])
+        if has_fractal:
+            cols.append(("FracD", 7))
     cols.append(("Complex", 8))
 
     header = " ".join(_cell(title, width) for title, width in cols)
@@ -991,22 +879,24 @@ def print_table(results: List[AuditResult], verbose: bool, use_color: bool) -> N
     for r in results:
         ast_m = r.ast_metrics
         row_parts = [
-            _display_path(r.file, 28),
+            _cell(r.file[-28:], 28),
             _cell(r.name, 32),
             _cell(str(r.lineno), 6),
             _cell(str(ast_m.loc), 5),
             _cell(str(ast_m.cyclomatic), 6),
-            _cell(str(ast_m.max_control_depth), 5),
             _cell(str(r.risk_score), 5),
             _cell(str(r.maintainability_score), 6),
             _cell(str(r.anomaly_score), 5),
         ]
-        if has_source: row_parts.append(_fmt_optional(r.src_entropy, 8))
-        if has_mse:
-            row_parts.append(_fmt_optional(r.opcode_entropy_mean, 7))
-            row_parts.append(_fmt_optional(r.mse_area_normalized, 6))
-        if has_fractal: row_parts.append(_fmt_optional(r.fractal, 7))
-        row_parts.append(score_cell(r.complexity, 8, use_color))
+        if verbose:
+            if has_source:
+                row_parts.append(_fmt_optional(r.src_entropy, 8))
+            if has_mse:
+                row_parts.append(_fmt_optional(r.opcode_entropy_mean, 7))
+                row_parts.append(_fmt_optional(r.mse_area_normalized, 6))
+            if has_fractal:
+                row_parts.append(_fmt_optional(r.fractal, 7))
+        row_parts.append(_cell(color_score(r.complexity, use_color) if use_color else str(r.complexity), 8))
         print(" ".join(row_parts))
 
     if verbose and has_mse:
@@ -1015,83 +905,55 @@ def print_table(results: List[AuditResult], verbose: bool, use_color: bool) -> N
             if r.mse_profile:
                 print(f"\n{r.file}:{r.name} (line {r.lineno})")
                 for scale, entropy in r.mse_profile:
-                    print(f"  τ={scale:2d} : {entropy:.4f}")
-
-    if verbose:
-        print("\n=== Extra AST/Risk Metrics ===")
-        for r in results[: min(20, len(results))]:
-            ast_m = r.ast_metrics
-            risk_m = r.risk_metrics
-            print(
-                f"\n{r.file}:{r.name} line {r.lineno}\n"
-                f"  AST: args={ast_m.arg_count}, calls={ast_m.calls}, returns={ast_m.returns}, "
-                f"assignments={ast_m.assignments}, comprehensions={ast_m.comprehensions}, "
-                f"ast_depth={ast_m.max_ast_depth}\n"
-                f"  Risk: broad_except={risk_m.broad_excepts}, silent_except={risk_m.silent_excepts}, "
-                f"eval_exec={risk_m.eval_exec_calls}, shell_true={risk_m.shell_true}, "
-                f"dynamic_attr={risk_m.dynamic_attr}, mutable_defaults={risk_m.mutable_defaults}"
-            )
+                    print(f" τ={scale:2d} : {entropy:.4f}")
 
 
-def print_explanations(results: List[AuditResult], limit: int = 20) -> None:
-    if not results: return
+def print_explanations(results: List[AuditResult]) -> None:
+    if not results:
+        return
     print("\n=== WHY THESE FUNCTIONS WERE FLAGGED ===")
-    for r in results[:limit]:
+    for r in results[:20]:
         print(f"\n{r.file}:{r.name} (line {r.lineno}) – Complexity {r.complexity}")
         for reason in r.reasons:
-            print(f"  • {reason}")
+            print(f" • {reason}")
 
 
 def print_summary(results: List[AuditResult], all_results_count: int, top_source: int, use_color: bool) -> None:
     if not results:
         print("\nNo functions matched the selected filters.")
         return
-
     print("\n" + "=" * 80)
     print(colorize("SUMMARY", BOLD, use_color))
-    analysed_files = len({r.file for r in results})
-    avg_complexity = statistics.mean(r.complexity for r in results)
-    median_complexity = statistics.median(r.complexity for r in results)
-    worst = max(results, key=lambda r: r.complexity)
-
-    print(f"• Files shown          : {analysed_files}")
-    print(f"• Functions shown      : {len(results)}")
+    print(f"• Files shown      : {len({r.file for r in results})}")
+    print(f"• Functions shown  : {len(results)}")
     if all_results_count != len(results):
-        print(f"• Functions analysed   : {all_results_count}")
-    print(f"• Average complexity   : {avg_complexity:.1f}")
-    print(f"• Median complexity    : {median_complexity:.1f}")
-    print(f"• Highest complexity   : {worst.file}:{worst.name} → {color_score(worst.complexity, use_color)}")
+        print(f"• Functions analysed : {all_results_count}")
+    print(f"• Average complexity : {statistics.mean(r.complexity for r in results):.1f}")
+    print(f"• Median complexity  : {statistics.median(r.complexity for r in results):.1f}")
+    worst = max(results, key=lambda r: r.complexity)
+    print(f"• Highest complexity : {worst.file}:{worst.name} → {color_score(worst.complexity, use_color)}")
 
     top_n = min(top_source or 5, len(results))
     print(f"\n{colorize(f'TOP {top_n} FUNCTIONS NEEDING REVIEW', BOLD, use_color)}")
-    for index, r in enumerate(results[:top_n], 1):
-        print(
-            f"  {index:2d}. {r.file}:{r.name} "
-            f"(line {r.lineno}) → {color_score(r.complexity, use_color)} "
-            f"[maint={r.maintainability_score}, anom={r.anomaly_score}, risk={r.risk_score}]"
-        )
+    for i, r in enumerate(results[:top_n], 1):
+        print(f" {i:2d}. {r.file}:{r.name} (line {r.lineno}) → {color_score(r.complexity, use_color)} "
+              f"[maint={r.maintainability_score}, anom={r.anomaly_score}, risk={r.risk_score}]")
 
     if top_source > 0:
-        print(f"\n{colorize(f'SOURCE CODE OF TOP {top_source} FUNCTIONS NEEDING REVIEW', BOLD, use_color)}")
+        print(f"\n{colorize(f'SOURCE CODE OF TOP {top_source} FUNCTIONS', BOLD, use_color)}")
         for r in results[:top_source]:
             print(f"\n{colorize(f'=== {r.file}:{r.name} (line {r.lineno}) – Complexity {r.complexity} ===', BOLD, use_color)}")
             print(r.source_snippet)
             print("-" * 60)
 
 
-def render_table_output(
-    results: List[AuditResult],
-    all_results_count: int,
-    verbose: bool,
-    top_source: int,
-    explain: bool,
-    use_color: bool,
-) -> str:
+def render_table_output(results: List[AuditResult], all_results_count: int, verbose: bool, top_source: int, explain: bool, use_color: bool) -> str:
     buf = io.StringIO()
     with redirect_stdout(buf):
         print_table(results, verbose=verbose, use_color=use_color)
-        if explain: print_explanations(results)
-        print_summary(results, all_results_count=all_results_count, top_source=top_source, use_color=use_color)
+        if explain:
+            print_explanations(results)
+        print_summary(results, all_results_count, top_source, use_color)
     return buf.getvalue()
 
 
@@ -1099,23 +961,9 @@ def render_json_output(results: List[AuditResult]) -> str:
     return json.dumps([r.to_json_dict() for r in results], indent=2, sort_keys=False)
 
 
-def validate_args(args: argparse.Namespace) -> None:
-    if args.m <= 0:
-        raise SystemExit("--m must be a positive integer")
-    if any(scale <= 0 for scale in args.scales):
-        raise SystemExit("--scales must contain only positive integers")
-    if args.min_score < 0 or args.min_score > 100:
-        raise SystemExit("--min-score must be between 0 and 100")
-    if args.fail_above is not None and not (0 <= args.fail_above <= 100):
-        raise SystemExit("--fail-above must be between 0 and 100")
-    if args.top_source < 0:
-        raise SystemExit("--top-source must be >= 0")
-
-
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    validate_args(args)
 
     if not (args.source or args.mse or args.fractal):
         args.source = args.mse = args.fractal = True
@@ -1131,9 +979,7 @@ def main() -> None:
     )
 
     all_results: List[AuditResult] = []
-    files = list(find_python_files(args.paths, exclude=args.exclude, include_tests=args.include_tests))
-
-    for py_file in files:
+    for py_file in find_python_files(args.paths, exclude=args.exclude, include_tests=args.include_tests):
         try:
             all_results.extend(auditor.analyse_file(py_file))
         except Exception as exc:
@@ -1143,16 +989,15 @@ def main() -> None:
         print("No Python functions found.", file=sys.stderr)
         sys.exit(1)
 
-    # OPTIMIZATION: Filter first, then sort to reduce sort overhead
+    all_results.sort(key=lambda r: _sort_value(r, args.sort) if 'sort' in dir(args) else r.complexity, reverse=True)
     filtered_results = [r for r in all_results if r.complexity >= args.min_score]
-    filtered_results.sort(key=lambda r: _sort_value(r, args.sort), reverse=True)
 
     if args.format == "json":
         output_text = render_json_output(filtered_results)
     else:
         output_text = render_table_output(
             filtered_results,
-            all_results_count=len(all_results),
+            len(all_results),
             verbose=args.verbose,
             top_source=args.top_source,
             explain=args.explain,
@@ -1165,14 +1010,33 @@ def main() -> None:
     else:
         print(output_text)
 
-    if args.fail_above is not None:
+    if getattr(args, 'fail_above', None) is not None:
         worst = max(r.complexity for r in all_results)
         if worst >= args.fail_above:
-            print(
-                f"Complexity gate failed: worst score {worst} >= --fail-above {args.fail_above}",
-                file=sys.stderr,
-            )
+            print(f"Complexity gate failed: worst score {worst} >= --fail-above {args.fail_above}", file=sys.stderr)
             sys.exit(2)
+
+
+def _sort_value(result: AuditResult, sort_key: SortKey) -> float:
+    if sort_key == "complexity":
+        return result.complexity
+    if sort_key == "risk":
+        return result.risk_score
+    if sort_key == "maintainability":
+        return result.maintainability_score
+    if sort_key == "anomaly":
+        return result.anomaly_score
+    if sort_key == "loc":
+        return result.ast_metrics.loc
+    if sort_key == "cyclomatic":
+        return result.ast_metrics.cyclomatic
+    if sort_key == "mse":
+        return result.opcode_entropy_mean or -1
+    if sort_key == "fractal":
+        return result.fractal or -1
+    if sort_key == "source":
+        return result.src_entropy or -1
+    return result.complexity
 
 
 if __name__ == "__main__":
